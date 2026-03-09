@@ -6,6 +6,7 @@
 #define SINK_LOG 1
 #define MAX_DRONES 16
 #define OFFLINE_TIMEOUT_SEC 5
+#define ATTACKER_ID_BASE 200
 
 #define RADIO_CHANNEL_START 129
 #define RADIO_CHANNEL_COUNT 4
@@ -24,6 +25,8 @@
 #define ALERT_INVALID   0x0040
 #define ALERT_FLOOD     0x0080
 #define ALERT_SELECTIVE 0x0100
+#define ALERT_BLACKHOLE 0x0200
+#define ALERT_IMPERSONATION 0x0400
 
 #define FLOOD_WINDOW_SEC 1
 #define FLOOD_MAX_PER_WINDOW 5
@@ -93,7 +96,7 @@ static struct mesh_conn mesh;
 static const char *
 alert_severity(uint16_t alerts)
 {
-  if(alerts & (ALERT_FIRE | ALERT_REPLAY | ALERT_INVALID)) {
+  if(alerts & (ALERT_FIRE | ALERT_REPLAY | ALERT_INVALID | ALERT_IMPERSONATION)) {
     return "CRIT";
   }
   if(alerts != 0) {
@@ -103,11 +106,8 @@ alert_severity(uint16_t alerts)
 }
 
 static const char *
-detect_attack(uint16_t alerts, uint8_t invalid_id)
+detect_attack(uint16_t alerts)
 {
-  if(invalid_id) {
-    return "impersonation";
-  }
   if(alerts & ALERT_INVALID) {
     return "spoofing";
   }
@@ -119,6 +119,12 @@ detect_attack(uint16_t alerts, uint8_t invalid_id)
   }
   if(alerts & ALERT_SELECTIVE) {
     return "selective_forwarding";
+  }
+  if(alerts & ALERT_BLACKHOLE) {
+    return "blackhole";
+  }
+  if(alerts & ALERT_IMPERSONATION) {
+    return "impersonation";
   }
   if(alerts & ALERT_PKT_GAP) {
     return "jamming";
@@ -158,7 +164,7 @@ account_alert(drone_state_t *st, uint16_t alerts)
     return;
   }
   st->alert_count++;
-  if(alerts & (ALERT_FIRE | ALERT_REPLAY | ALERT_INVALID)) {
+  if(alerts & (ALERT_FIRE | ALERT_REPLAY | ALERT_INVALID | ALERT_IMPERSONATION)) {
     st->crit_count++;
   } else {
     st->warn_count++;
@@ -221,13 +227,14 @@ static void
 send_hop_command_all(uint8_t ch)
 {
   linkaddr_t dest;
-  int i;
+  uint8_t self = linkaddr_node_addr.u8[0];
+  uint8_t id;
 
-  for(i = 0; i < MAX_DRONES; i++) {
-    if(!states[i].used) {
+  for(id = 1; id <= MAX_DRONES; id++) {
+    if(id == self) {
       continue;
     }
-    dest.u8[0] = states[i].drone_id;
+    dest.u8[0] = id;
     dest.u8[1] = 0;
     send_hop_command(&dest, ch);
   }
@@ -263,7 +270,12 @@ static void recv_mesh(struct mesh_conn *c, const linkaddr_t *from, uint8_t hops)
   uint16_t alerts = 0;
   uint8_t invalid_id = 0;
   uint8_t invalid = 0;
+  uint8_t invalid_mac = 0;
+  uint8_t invalid_fields = 0;
   uint8_t rate_limited = 0;
+  uint8_t replay_detected = 0;
+  uint8_t is_attacker = 0;
+  uint8_t sender_id = 0;
   uint16_t prev_seq = 0;
   uint32_t prev_t = 0;
   uint16_t gap = 0;
@@ -280,27 +292,32 @@ static void recv_mesh(struct mesh_conn *c, const linkaddr_t *from, uint8_t hops)
       return;
     }
 
-    if(msg.drone_id != from->u8[0]) {
+    sender_id = from->u8[0];
+    if(msg.drone_id != sender_id) {
       invalid_id = 1;
+    }
+    if(sender_id >= ATTACKER_ID_BASE) {
+      is_attacker = 1;
     }
 
     expected_mac = msg.mac;
     msg.mac = 0;
     if(expected_mac != mac_fnv1a(&msg, sizeof(msg))) {
-      invalid = 1;
+      invalid_mac = 1;
     }
-    if(msg.ver != MSG_VER || invalid_id) {
-      invalid = 1;
+    if(msg.ver != MSG_VER) {
+      invalid_fields = 1;
     }
 
     if(msg.temp > 120 || msg.vib > 1500 || msg.gas > 2000 ||
        msg.batt_mv < 2600 || msg.batt_mv > 5000) {
-      invalid = 1;
+      invalid_fields = 1;
     }
 
-    if(invalid) {
+    if(invalid_mac || invalid_fields) {
       alerts |= ALERT_INVALID;
     }
+    invalid = (uint8_t)(invalid_mac || invalid_fields);
 
     if(msg.gas >= 380) {
       alerts |= ALERT_GAS;
@@ -315,6 +332,29 @@ static void recv_mesh(struct mesh_conn *c, const linkaddr_t *from, uint8_t hops)
       alerts |= ALERT_BAT_LOW;
     }
 
+    if(st->last_seq != 0) {
+      prev_seq = st->last_seq;
+      prev_t = st->last_t;
+      if(msg.seq <= st->last_seq) {
+        alerts |= ALERT_REPLAY;
+        replay_detected = 1;
+      } else if(msg.seq > (uint16_t)(st->last_seq + 1)) {
+        gap = (uint16_t)(msg.seq - st->last_seq - 1);
+        st->missed_packets += gap;
+        if(!is_attacker) {
+          global_missed += gap;
+        }
+        alerts |= ALERT_PKT_GAP;
+      }
+      if(prev_t != 0 && (msg.t > prev_t + OFFLINE_TIMEOUT_SEC)) {
+        alerts |= ALERT_PKT_GAP;
+      }
+    }
+
+    if(invalid_id && !invalid_mac && !invalid_fields && !replay_detected) {
+      alerts |= ALERT_IMPERSONATION;
+    }
+
     now = clock_seconds();
     if(st->window_start == 0 || now - st->window_start >= FLOOD_WINDOW_SEC) {
       st->window_start = now;
@@ -327,36 +367,22 @@ static void recv_mesh(struct mesh_conn *c, const linkaddr_t *from, uint8_t hops)
     }
 
     if(!rate_limited) {
-      if(st->last_seq != 0) {
-        prev_seq = st->last_seq;
-        prev_t = st->last_t;
-        if(msg.seq <= st->last_seq) {
-          alerts |= ALERT_REPLAY;
-        } else if(msg.seq > (uint16_t)(st->last_seq + 1)) {
-          gap = (uint16_t)(msg.seq - st->last_seq - 1);
-          st->missed_packets += gap;
-          global_missed += gap;
-          alerts |= ALERT_PKT_GAP;
-        }
-        if(prev_t != 0 && (msg.t > prev_t + OFFLINE_TIMEOUT_SEC)) {
-          alerts |= ALERT_PKT_GAP;
-        }
-      }
-
-      if(!invalid && !(alerts & ALERT_REPLAY)) {
+      if(!invalid && !replay_detected) {
         st->last_seq = msg.seq;
         st->last_t = msg.t;
-        st->data_count++;
-        global_received++;
+        if(!is_attacker) {
+          st->data_count++;
+          global_received++;
+        }
       }
     } else {
-      if(!invalid && msg.seq > st->last_seq) {
+      if(!invalid && !replay_detected && msg.seq > st->last_seq) {
         st->last_seq = msg.seq;
         st->last_t = msg.t;
       }
     }
 
-    if(!rate_limited && (alerts & ALERT_PKT_GAP)) {
+    if(!is_attacker && !rate_limited && (alerts & ALERT_PKT_GAP)) {
       uint32_t node_total = st->data_count + st->missed_packets;
       uint32_t global_total = global_received + global_missed;
       if(node_total >= SELECTIVE_MIN_SAMPLES && global_total >= SELECTIVE_GLOBAL_MIN) {
@@ -373,19 +399,21 @@ static void recv_mesh(struct mesh_conn *c, const linkaddr_t *from, uint8_t hops)
     st->offline_reported = 0;
 
 #if SINK_LOG
-    printf("DATA,id=%u,from=%u.%u,seq=%u,t=%lu,temp=%u,vib=%u,gas=%u,batt=%u,alerts=0x%04x\n",
-           msg.drone_id, from->u8[0], from->u8[1], msg.seq, (unsigned long)msg.t,
-           msg.temp, msg.vib, msg.gas, msg.batt_mv, alerts);
-    printf("CSV_DATA,%lu,%s,%u,%u,%u,%u,%u,%u,%u,%u,%lu,%lu,%lu,%lu,%s,%s\n",
-           (unsigned long)clock_seconds(), alert_severity(alerts), msg.drone_id, msg.seq,
-           msg.temp, msg.vib, msg.gas, msg.batt_mv, alerts, st->missed_packets,
-           (unsigned long)st->data_count, (unsigned long)st->alert_count,
-           (unsigned long)st->warn_count, (unsigned long)st->crit_count,
-           detect_attack(alerts, invalid_id),
-           detect_hazard(alerts));
+    if(!is_attacker) {
+      printf("DATA,id=%u,from=%u.%u,seq=%u,t=%lu,temp=%u,vib=%u,gas=%u,batt=%u,alerts=0x%04x\n",
+             msg.drone_id, from->u8[0], from->u8[1], msg.seq, (unsigned long)msg.t,
+             msg.temp, msg.vib, msg.gas, msg.batt_mv, alerts);
+      printf("CSV_DATA,%lu,%s,%u,%u,%u,%u,%u,%u,%u,%u,%lu,%lu,%lu,%lu,%s,%s\n",
+             (unsigned long)clock_seconds(), alert_severity(alerts), msg.drone_id, msg.seq,
+             msg.temp, msg.vib, msg.gas, msg.batt_mv, alerts, st->missed_packets,
+             (unsigned long)st->data_count, (unsigned long)st->alert_count,
+             (unsigned long)st->warn_count, (unsigned long)st->crit_count,
+             detect_attack(alerts),
+             detect_hazard(alerts));
+    }
     if(alerts != 0) {
       printf("ALERT,sev=%s,attack=%s,hazard=%s,id=%u,seq=%u,flags=0x%04x,prev_seq=%u,gap=%u,missed_total=%lu,alerts_total=%lu\n",
-             alert_severity(alerts), detect_attack(alerts, invalid_id),
+             alert_severity(alerts), detect_attack(alerts),
              detect_hazard(alerts),
              msg.drone_id, msg.seq, alerts, prev_seq, gap,
              (unsigned long)st->missed_packets, (unsigned long)st->alert_count);
@@ -394,12 +422,12 @@ static void recv_mesh(struct mesh_conn *c, const linkaddr_t *from, uint8_t hops)
              msg.seq, msg.temp, msg.vib, msg.gas, msg.batt_mv, alerts,
              (unsigned long)st->missed_packets, (unsigned long)st->data_count,
              (unsigned long)st->alert_count, (unsigned long)st->warn_count,
-             (unsigned long)st->crit_count, detect_attack(alerts, invalid_id),
+             (unsigned long)st->crit_count, detect_attack(alerts),
              detect_hazard(alerts));
     }
 #endif
 
-    if((alerts & ALERT_PKT_GAP) &&
+    if(!is_attacker && (alerts & ALERT_PKT_GAP) &&
        (now - last_hop_time) >= HOP_COOLDOWN_SEC) {
       hop_target = next_channel();
       hop_pending = 1;
@@ -436,24 +464,26 @@ PROCESS_THREAD(sink_proc, ev, data)
       now = clock_seconds();
       for(i = 0; i < MAX_DRONES; i++) {
         if(states[i].used &&
+           states[i].drone_id < ATTACKER_ID_BASE &&
            states[i].last_t > 0 &&
            !states[i].offline_reported &&
-           now > (states[i].last_t + OFFLINE_TIMEOUT_SEC)) {
+          now > (states[i].last_t + OFFLINE_TIMEOUT_SEC)) {
 #if SINK_LOG
-          account_alert(&states[i], ALERT_PKT_GAP);
+          uint16_t offline_alerts = ALERT_PKT_GAP | ALERT_BLACKHOLE;
+          account_alert(&states[i], offline_alerts);
           printf("ALERT,sev=%s,attack=%s,hazard=%s,id=%u,seq=%u,flags=0x%04x,reason=offline,last_t=%lu,now=%lu,alerts_total=%lu\n",
-                 alert_severity(ALERT_PKT_GAP), detect_attack(ALERT_PKT_GAP, 0),
-                 detect_hazard(ALERT_PKT_GAP),
-                 states[i].drone_id, states[i].last_seq, ALERT_PKT_GAP,
+                 alert_severity(offline_alerts), detect_attack(offline_alerts),
+                 detect_hazard(offline_alerts),
+                 states[i].drone_id, states[i].last_seq, offline_alerts,
                  (unsigned long)states[i].last_t, (unsigned long)now,
                  (unsigned long)states[i].alert_count);
           printf("CSV_ALERT,%lu,%s,%u,%u,%u,%u,%u,%u,%u,%u,%lu,%lu,%lu,%lu,%s,%s\n",
-                 (unsigned long)now, alert_severity(ALERT_PKT_GAP),
-                 states[i].drone_id, states[i].last_seq, 0, 0, 0, 0, ALERT_PKT_GAP,
+                 (unsigned long)now, alert_severity(offline_alerts),
+                 states[i].drone_id, states[i].last_seq, 0, 0, 0, 0, offline_alerts,
                  (unsigned long)states[i].missed_packets, (unsigned long)states[i].data_count,
                  (unsigned long)states[i].alert_count, (unsigned long)states[i].warn_count,
-                 (unsigned long)states[i].crit_count, detect_attack(ALERT_PKT_GAP, 0),
-                 detect_hazard(ALERT_PKT_GAP));
+                 (unsigned long)states[i].crit_count, detect_attack(offline_alerts),
+                 detect_hazard(offline_alerts));
 #endif
           states[i].offline_reported = 1;
         }

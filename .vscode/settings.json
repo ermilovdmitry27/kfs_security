@@ -2,6 +2,11 @@
   "clangd.arguments": [
     "--compile-commands-dir=${workspaceFolder}/examples/drone_sim"
   ],
+  "git.autorefresh": false,
+  "git.autoRepositoryDetection": false,
+  "git.detectSubmodules": false,
+  "git.detectWorktrees": false,
+  "git.repositoryScanMaxDepth": 0,
   "C_Cpp.intelliSenseEngine": "Disabled",
   "makefile.configureOnOpen": false,
   "C_Cpp_Runner.msvcBatchPath": "",
@@ -60,5 +65,25 @@
   "C_Cpp_Runner.useLeakSanitizer": false,
   "C_Cpp_Runner.showCompilationTime": false,
   "C_Cpp_Runner.useLinkTimeOptimization": false,
-  "C_Cpp_Runner.msvcSecureNoWarnings": false
+  "C_Cpp_Runner.msvcSecureNoWarnings": false,
+  "files.watcherExclude": {
+    "**/tools/cooja/build/**": true,
+    "**/org/contikios/cooja/corecomm/**": true,
+    "**/*.class": true,
+    "**/*.o": true,
+    "**/*.a": true,
+    "**/*.elf": true,
+    "**/*.bin": true,
+    "**/*.map": true
+  },
+  "search.exclude": {
+    "**/tools/cooja/build/**": true,
+    "**/org/contikios/cooja/corecomm/**": true,
+    "**/*.class": true,
+    "**/*.o": true,
+    "**/*.a": true,
+    "**/*.elf": true,
+    "**/*.bin": true,
+    "**/*.map": true
+  }
 }

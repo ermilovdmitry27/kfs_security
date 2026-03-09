@@ -612,7 +612,7 @@ public class LogListener extends VisPlugin implements HasQuickHelp {
           data.getID() + "\t" +
           data.ev.getMessage() + "\n"
       );
-      appendCsvSplitLine(appendStreamFile, data.ev.getMessage());
+      appendCsvSplitLine(appendStreamFile, data.getID(), data.ev.getMessage());
     }
   }
 
@@ -844,6 +844,9 @@ public class LogListener extends VisPlugin implements HasQuickHelp {
   private static final String CSV_RUN_DIR_PREFIX = "run_";
   private String csvHeader = DEFAULT_CSV_HEADER;
   private final Map<String, PrintWriter> csvSplitStreams = new HashMap<String, PrintWriter>();
+  private final Map<String, Boolean> csvSplitModuleIds = new HashMap<String, Boolean>();
+  private final Map<String, Boolean> csvSplitDroneIds = new HashMap<String, Boolean>();
+  private final List<String> csvSplitModuleAlerts = new ArrayList<String>();
   private File csvSplitSessionDir = null;
 
   private String createCsvSessionStamp() {
@@ -876,6 +879,54 @@ public class LogListener extends VisPlugin implements HasQuickHelp {
     csvSplitStreams.clear();
   }
 
+  private void clearCsvSplitState() {
+    closeCsvSplitStreams();
+    csvSplitModuleIds.clear();
+    csvSplitDroneIds.clear();
+    csvSplitModuleAlerts.clear();
+    csvSplitSessionDir = null;
+  }
+
+  private String rewriteCsvPayloadForDrone(String payload, String droneId) {
+    String[] cols = payload.split(",", -1);
+    if (cols.length < 3) {
+      return payload;
+    }
+    cols[2] = droneId;
+    StringBuilder rewritten = new StringBuilder(cols[0]);
+    for (int i = 1; i < cols.length; i++) {
+      rewritten.append(',').append(cols[i]);
+    }
+    return rewritten.toString();
+  }
+
+  private void appendModuleAlertToDrone(File sessionDir, String droneId, String payload, boolean appendToAll)
+      throws IOException {
+    if (!csvSplitDroneIds.containsKey(droneId)) {
+      return;
+    }
+
+    String rewritten = rewriteCsvPayloadForDrone(payload, droneId);
+    File allDir = new File(sessionDir, "all");
+    File droneDir = new File(sessionDir, droneId);
+
+    if (appendToAll) {
+      PrintWriter all = getCsvStream(new File(allDir, "telemetry.csv"));
+      PrintWriter allAlert = getCsvStream(new File(allDir, "telemetry_alert.csv"));
+      all.println("ALERT," + rewritten);
+      all.flush();
+      allAlert.println(rewritten);
+      allAlert.flush();
+    }
+
+    PrintWriter drone = getCsvStream(new File(droneDir, "telemetry.csv"));
+    PrintWriter droneAlert = getCsvStream(new File(droneDir, "telemetry_alert.csv"));
+    drone.println("ALERT," + rewritten);
+    drone.flush();
+    droneAlert.println(rewritten);
+    droneAlert.flush();
+  }
+
   private PrintWriter getCsvStream(File file) throws IOException {
     String key = file.getAbsolutePath();
     PrintWriter stream = csvSplitStreams.get(key);
@@ -905,14 +956,26 @@ public class LogListener extends VisPlugin implements HasQuickHelp {
     return stream;
   }
 
-  private void appendCsvSplitLine(File appendFile, String message) {
+  private void appendCsvSplitLine(File appendFile, String moteId, String message) {
     if (appendFile == null || message == null) {
       return;
+    }
+
+    String normalizedMoteId = moteId == null ? "" : moteId.trim();
+    if (normalizedMoteId.startsWith("ID:")) {
+      normalizedMoteId = normalizedMoteId.substring(3).trim();
     }
 
     if (message.startsWith("CSV_HEADER,")) {
       csvHeader = message.substring("CSV_HEADER,".length());
       closeCsvSplitStreams();
+      return;
+    }
+
+    if (message.startsWith("ALERT,") && message.contains("source=module")) {
+      if (!normalizedMoteId.isEmpty()) {
+        csvSplitModuleIds.put(normalizedMoteId, Boolean.TRUE);
+      }
       return;
     }
 
@@ -937,9 +1000,29 @@ public class LogListener extends VisPlugin implements HasQuickHelp {
       return;
     }
 
+    boolean moduleAlert = "ALERT".equals(type) && csvSplitModuleIds.containsKey(droneId);
+    if ("DATA".equals(type) && csvSplitModuleIds.containsKey(droneId)) {
+      return;
+    }
+
     File sessionDir = getCsvSessionDir(appendFile);
 
     try {
+      if (moduleAlert) {
+        csvSplitModuleAlerts.add(payload);
+        for (String knownDroneId : new ArrayList<String>(csvSplitDroneIds.keySet())) {
+          appendModuleAlertToDrone(sessionDir, knownDroneId, payload, true);
+        }
+        return;
+      }
+
+      if (!csvSplitDroneIds.containsKey(droneId)) {
+        csvSplitDroneIds.put(droneId, Boolean.TRUE);
+        for (String modulePayload : csvSplitModuleAlerts) {
+          appendModuleAlertToDrone(sessionDir, droneId, modulePayload, false);
+        }
+      }
+
       File allDir = new File(sessionDir, "all");
       File droneDir = new File(sessionDir, droneId);
 
@@ -979,8 +1062,7 @@ public class LogListener extends VisPlugin implements HasQuickHelp {
         appendStream.close();
         appendStream = null;
       }
-      closeCsvSplitStreams();
-      csvSplitSessionDir = null;
+      clearCsvSplitState();
       return false;
     }
 
@@ -991,8 +1073,7 @@ public class LogListener extends VisPlugin implements HasQuickHelp {
           appendStream.close();
           appendStream = null;
         }
-        closeCsvSplitStreams();
-        csvSplitSessionDir = null;
+        clearCsvSplitState();
         appendStream = new PrintWriter(new FileWriter(file,true));
         appendStreamFile = file;
         appendToFileWroteHeader = false;

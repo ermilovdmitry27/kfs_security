@@ -700,8 +700,10 @@ public class Simulation extends Observable implements Runnable {
 
         MoteType moteType = moteTypeClass.getConstructor((Class[]) null).newInstance();
 
+        /* In quickstart mode, force non-visual mote type init to avoid
+         * interactive Compile Contiki dialogs for each mote type. */
         boolean createdOK = moteType.setConfigXML(this, element.getChildren(),
-            visAvailable);
+            visAvailable && !quick);
         if (createdOK) {
           addMoteType(moteType);
         } else {

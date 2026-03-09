@@ -1,0 +1,18 @@
+{
+  "recommendations": [
+    "ms-vscode.cpptools",
+    "amiralizadeh9480.cpp-helper",
+    "openai.chatgpt"
+  ],
+  "unwantedRecommendations": [
+    "ms-python.python",
+    "ms-python.vscode-pylance",
+    "ms-python.vscode-python-envs",
+    "ms-python.debugpy",
+    "ms-vscode-remote.remote-containers",
+    "ms-azuretools.vscode-containers",
+    "ms-vscode-remote.remote-ssh",
+    "ms-vscode-remote.remote-ssh-edit",
+    "ms-vscode.remote-explorer"
+  ]
+}

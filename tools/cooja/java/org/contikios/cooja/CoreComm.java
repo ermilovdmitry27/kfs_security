@@ -213,40 +213,30 @@ public abstract class CoreComm {
         .getInputStream(MessageList.ERROR);
 
     File classFile = new File("org/contikios/cooja/corecomm/" + className + ".class");
+    File sourceFile = new File("org/contikios/cooja/corecomm/" + className + ".java");
 
     try {
       int b;
-      String[] cmd = new String[] { Cooja.getExternalToolsSetting("PATH_JAVAC"),
-          "-version", "org/contikios/cooja/corecomm/" + className + ".java" };
+      String classPath = System.getProperty("java.class.path");
+      String coojaJar = Cooja.getExternalToolsSetting("PATH_CONTIKI")
+          + "/tools/cooja/dist/cooja.jar";
+
+      if (classPath == null || classPath.isEmpty()) {
+        classPath = coojaJar;
+      } else if (!classPath.contains(coojaJar)) {
+        classPath = classPath + File.pathSeparator + coojaJar;
+      }
+
+      String[] cmd = new String[] {
+          Cooja.getExternalToolsSetting("PATH_JAVAC"),
+          "-cp",
+          classPath,
+          sourceFile.getPath()
+      };
 
       Process p = Runtime.getRuntime().exec(cmd, null, null);
       InputStream outputStream = p.getInputStream();
       InputStream errorStream = p.getErrorStream();
-      while ((b = outputStream.read()) >= 0) {
-        compilationStandardStream.write(b);
-      }
-      while ((b = errorStream.read()) >= 0) {
-        compilationErrorStream.write(b);
-      }
-      p.waitFor();
-
-      if (classFile.exists()) {
-        return;
-      }
-
-      // Try including cooja.jar
-      cmd = new String[] {
-          Cooja.getExternalToolsSetting("PATH_JAVAC"),
-          "-version",
-          "org/contikios/cooja/corecomm/" + className + ".java",
-          "-cp",
-          Cooja.getExternalToolsSetting("PATH_CONTIKI")
-              + "/tools/cooja/dist/cooja.jar" };
-
-      p = Runtime.getRuntime().exec(cmd, null, null);
-
-      outputStream = p.getInputStream();
-      errorStream = p.getErrorStream();
       while ((b = outputStream.read()) >= 0) {
         compilationStandardStream.write(b);
       }
