@@ -54,8 +54,10 @@ import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Date;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.regex.PatternSyntaxException;
 
 import javax.swing.AbstractAction;
@@ -840,13 +842,74 @@ public class LogListener extends VisPlugin implements HasQuickHelp {
   private boolean appendToFileWroteHeader = false;
   private PrintWriter appendStream = null;
   private static final String DEFAULT_CSV_HEADER =
-      "sim_t,severity,drone_id,seq,temp,vib,gas,batt_mv,alerts,missed_total,data_count,alert_count,warn_count,crit_count,attack";
+      "sim_t,severity,drone_id,seq,temp,vib,gas,batt_mv,alerts,missed_total,data_count,alert_count,warn_count,crit_count,attack,hazard,risk,state,response";
+  private static final String DEFAULT_DECISION_CSV_HEADER =
+      "sim_t,drone_id,prev_state,state,prev_response,response,risk,reason,alerts,attack";
+  private static final String SECURITY_SUMMARY_HEADER =
+      "drones,data_rows,alert_rows,decision_rows,attacked_drones,recovered_drones,recovery_rate_pct,max_risk,channel_hops,rate_limits,rate_limit_releases,quarantines,quarantine_releases,reroutes,isolate_relay_actions,crit_alerts,warn_alerts";
   private static final String CSV_RUN_DIR_PREFIX = "run_";
+  private static final String[] CSV_EMBEDDED_MARKERS = {
+      "CSV_DATA,",
+      "CSV_ALERT,",
+      "CSV_DECISION,",
+      "DATA,",
+      "ALERT,",
+      "DECISION,"
+  };
+  private static final String[] SECURITY_STATE_NAMES = {
+      "NORMAL",
+      "SUSPICIOUS",
+      "UNDER_ATTACK",
+      "ISOLATED",
+      "RECOVERING",
+      "RECOVERED"
+  };
+  private static final String[] SECURITY_RESPONSE_NAMES = {
+      "none",
+      "observe",
+      "channel_hop",
+      "rate_limit",
+      "quarantine",
+      "reroute",
+      "isolate_relay"
+  };
+  private static final String[] SECURITY_ATTACK_NAMES = {
+      "none",
+      "replay",
+      "flood",
+      "spoofing",
+      "impersonation",
+      "jamming",
+      "blackhole",
+      "selective_forwarding"
+  };
+  private static final String[] SECURITY_SEVERITY_NAMES = {
+      "INFO",
+      "WARN",
+      "CRIT"
+  };
   private String csvHeader = DEFAULT_CSV_HEADER;
+  private String csvDecisionHeader = DEFAULT_DECISION_CSV_HEADER;
   private final Map<String, PrintWriter> csvSplitStreams = new HashMap<String, PrintWriter>();
   private final Map<String, Boolean> csvSplitModuleIds = new HashMap<String, Boolean>();
   private final Map<String, Boolean> csvSplitDroneIds = new HashMap<String, Boolean>();
   private final List<String> csvSplitModuleAlerts = new ArrayList<String>();
+  private final Set<String> csvSummaryDroneIds = new HashSet<String>();
+  private final Set<String> csvSummaryAttackedDroneIds = new HashSet<String>();
+  private final Set<String> csvSummaryRecoveredDroneIds = new HashSet<String>();
+  private int csvSummaryDataRows = 0;
+  private int csvSummaryAlertRows = 0;
+  private int csvSummaryDecisionRows = 0;
+  private int csvSummaryMaxRisk = 0;
+  private int csvSummaryChannelHops = 0;
+  private int csvSummaryRateLimits = 0;
+  private int csvSummaryRateLimitReleases = 0;
+  private int csvSummaryQuarantines = 0;
+  private int csvSummaryQuarantineReleases = 0;
+  private int csvSummaryReroutes = 0;
+  private int csvSummaryIsolateRelayActions = 0;
+  private int csvSummaryCritAlerts = 0;
+  private int csvSummaryWarnAlerts = 0;
   private File csvSplitSessionDir = null;
 
   private String createCsvSessionStamp() {
@@ -884,7 +947,25 @@ public class LogListener extends VisPlugin implements HasQuickHelp {
     csvSplitModuleIds.clear();
     csvSplitDroneIds.clear();
     csvSplitModuleAlerts.clear();
+    csvSummaryDroneIds.clear();
+    csvSummaryAttackedDroneIds.clear();
+    csvSummaryRecoveredDroneIds.clear();
+    csvSummaryDataRows = 0;
+    csvSummaryAlertRows = 0;
+    csvSummaryDecisionRows = 0;
+    csvSummaryMaxRisk = 0;
+    csvSummaryChannelHops = 0;
+    csvSummaryRateLimits = 0;
+    csvSummaryRateLimitReleases = 0;
+    csvSummaryQuarantines = 0;
+    csvSummaryQuarantineReleases = 0;
+    csvSummaryReroutes = 0;
+    csvSummaryIsolateRelayActions = 0;
+    csvSummaryCritAlerts = 0;
+    csvSummaryWarnAlerts = 0;
     csvSplitSessionDir = null;
+    csvHeader = DEFAULT_CSV_HEADER;
+    csvDecisionHeader = DEFAULT_DECISION_CSV_HEADER;
   }
 
   private String rewriteCsvPayloadForDrone(String payload, String droneId) {
@@ -900,6 +981,149 @@ public class LogListener extends VisPlugin implements HasQuickHelp {
     return rewritten.toString();
   }
 
+  private String moduleDecisionReasonFromResponse(String response) {
+    if ("channel_hop".equals(response)) {
+      return "apply_channel_hop";
+    }
+    if ("reroute".equals(response)) {
+      return "apply_reroute";
+    }
+    if ("isolate_relay".equals(response)) {
+      return "apply_isolate_relay";
+    }
+    return "module_alert";
+  }
+
+  private String buildModuleDecisionPayload(String alertPayload, String droneId) {
+    String[] cols = alertPayload.split(",", -1);
+    if (cols.length < 19) {
+      return null;
+    }
+    String simTime = cols[0].trim();
+    String alerts = cols[8].trim();
+    String attack = cols[14].trim();
+    String risk = cols[16].trim();
+    String state = cols[17].trim();
+    String response = cols[18].trim();
+    return simTime + "," +
+        droneId + "," +
+        "NORMAL," +
+        state + "," +
+        "none," +
+        response + "," +
+        risk + "," +
+        moduleDecisionReasonFromResponse(response) + "," +
+        alerts + "," +
+        attack;
+  }
+
+  private int parseCsvInt(String value) {
+    try {
+      return Integer.parseInt(value.trim());
+    } catch (Exception e) {
+      return 0;
+    }
+  }
+
+  private void writeSecuritySummary(File sessionDir) throws IOException {
+    File summaryFile = new File(new File(sessionDir, "all"), "security_summary.csv");
+    int attackedCount = csvSummaryAttackedDroneIds.size();
+    int recoveredCount = csvSummaryRecoveredDroneIds.size();
+    int recoveryRate = attackedCount == 0 ? 0 : (recoveredCount * 100) / attackedCount;
+    PrintWriter summary = new PrintWriter(new FileWriter(summaryFile, false));
+    summary.println(SECURITY_SUMMARY_HEADER);
+    summary.println(
+        csvSummaryDroneIds.size() + "," +
+        csvSummaryDataRows + "," +
+        csvSummaryAlertRows + "," +
+        csvSummaryDecisionRows + "," +
+        attackedCount + "," +
+        recoveredCount + "," +
+        recoveryRate + "," +
+        csvSummaryMaxRisk + "," +
+        csvSummaryChannelHops + "," +
+        csvSummaryRateLimits + "," +
+        csvSummaryRateLimitReleases + "," +
+        csvSummaryQuarantines + "," +
+        csvSummaryQuarantineReleases + "," +
+        csvSummaryReroutes + "," +
+        csvSummaryIsolateRelayActions + "," +
+        csvSummaryCritAlerts + "," +
+        csvSummaryWarnAlerts);
+    summary.close();
+  }
+
+  private void updateSecuritySummary(File sessionDir, String type, String payload)
+      throws IOException {
+    String[] cols = payload.split(",", -1);
+    String droneId;
+    int risk;
+
+    if ("DATA".equals(type) || "ALERT".equals(type)) {
+      if (cols.length < 19) {
+        return;
+      }
+      droneId = cols[2].trim();
+      if (droneId.isEmpty()) {
+        return;
+      }
+      csvSummaryDroneIds.add(droneId);
+      risk = parseCsvInt(cols[16]);
+      csvSummaryMaxRisk = Math.max(csvSummaryMaxRisk, risk);
+      if (!"none".equals(cols[14].trim())) {
+        csvSummaryAttackedDroneIds.add(droneId);
+      }
+      if ("DATA".equals(type)) {
+        csvSummaryDataRows++;
+      } else {
+        csvSummaryAlertRows++;
+        if ("CRIT".equals(cols[1].trim())) {
+          csvSummaryCritAlerts++;
+        } else if ("WARN".equals(cols[1].trim())) {
+          csvSummaryWarnAlerts++;
+        }
+      }
+    } else if ("DECISION".equals(type)) {
+      if (cols.length < 10) {
+        return;
+      }
+      droneId = cols[1].trim();
+      if (droneId.isEmpty()) {
+        return;
+      }
+      csvSummaryDroneIds.add(droneId);
+      csvSummaryDecisionRows++;
+      risk = parseCsvInt(cols[6]);
+      csvSummaryMaxRisk = Math.max(csvSummaryMaxRisk, risk);
+      if (!"none".equals(cols[9].trim())) {
+        csvSummaryAttackedDroneIds.add(droneId);
+      }
+      if ("RECOVERED".equals(cols[3].trim()) || "recovered".equals(cols[7].trim())) {
+        csvSummaryRecoveredDroneIds.add(droneId);
+      }
+      if ("apply_rate_limit".equals(cols[7].trim())) {
+        csvSummaryRateLimits++;
+      } else if ("rate_limit_released".equals(cols[7].trim())) {
+        csvSummaryRateLimitReleases++;
+      } else if ("apply_quarantine".equals(cols[7].trim())) {
+        csvSummaryQuarantines++;
+      } else if ("quarantine_released".equals(cols[7].trim())) {
+        csvSummaryQuarantineReleases++;
+      } else if ("apply_reroute".equals(cols[7].trim())) {
+        csvSummaryReroutes++;
+      } else if ("apply_isolate_relay".equals(cols[7].trim())) {
+        csvSummaryIsolateRelayActions++;
+      }
+      if ("channel_hop".equals(cols[5].trim())) {
+        csvSummaryChannelHops++;
+      }
+    } else {
+      return;
+    }
+
+    writeSecuritySummary(sessionDir);
+  }
+
   private void appendModuleAlertToDrone(File sessionDir, String droneId, String payload, boolean appendToAll)
       throws IOException {
     if (!csvSplitDroneIds.containsKey(droneId)) {
@@ -907,6 +1131,7 @@ public class LogListener extends VisPlugin implements HasQuickHelp {
     }
 
     String rewritten = rewriteCsvPayloadForDrone(payload, droneId);
+    String decisionPayload = buildModuleDecisionPayload(payload, droneId);
     File allDir = new File(sessionDir, "all");
     File droneDir = new File(sessionDir, droneId);
 
@@ -917,6 +1142,13 @@ public class LogListener extends VisPlugin implements HasQuickHelp {
       all.flush();
       allAlert.println(rewritten);
       allAlert.flush();
+      updateSecuritySummary(sessionDir, "ALERT", rewritten);
+      if (decisionPayload != null) {
+        PrintWriter allDecision = getCsvStream(new File(allDir, "security_decisions.csv"));
+        allDecision.println(decisionPayload);
+        allDecision.flush();
+        updateSecuritySummary(sessionDir, "DECISION", decisionPayload);
+      }
     }
 
     PrintWriter drone = getCsvStream(new File(droneDir, "telemetry.csv"));
@@ -925,6 +1157,81 @@ public class LogListener extends VisPlugin implements HasQuickHelp {
     drone.flush();
     droneAlert.println(rewritten);
     droneAlert.flush();
+    if (decisionPayload != null) {
+      PrintWriter droneDecision = getCsvStream(new File(droneDir, "security_decisions.csv"));
+      droneDecision.println(decisionPayload);
+      droneDecision.flush();
+    }
+  }
+
+  private static String joinCsvColumns(String[] cols) {
+    if (cols.length == 0) {
+      return "";
+    }
+    StringBuilder builder = new StringBuilder(cols[0]);
+    for (int i = 1; i < cols.length; i++) {
+      builder.append(',').append(cols[i]);
+    }
+    return builder.toString();
+  }
+
+  private static String normalizeKnownToken(String value, String[] knownValues) {
+    String token = value == null ? "" : value.trim();
+    if (token.isEmpty()) {
+      return token;
+    }
+    int matchIndex = -1;
+    for (int i = 0; i < knownValues.length; i++) {
+      if (knownValues[i].equals(token)) {
+        return token;
+      }
+      if (knownValues[i].startsWith(token)) {
+        if (matchIndex >= 0) {
+          return token;
+        }
+        matchIndex = i;
+      }
+    }
+    return matchIndex >= 0 ? knownValues[matchIndex] : token;
+  }
+
+  private static int findEmbeddedCsvMarker(String payload) {
+    int match = -1;
+    for (String marker : CSV_EMBEDDED_MARKERS) {
+      int idx = payload.indexOf(marker);
+      if (idx > 0 && (match < 0 || idx < match)) {
+        match = idx;
+      }
+    }
+    return match;
+  }
+
+  private static String sanitizeCsvPayload(String type, String payload) {
+    if (payload == null) {
+      return null;
+    }
+
+    int embedded = findEmbeddedCsvMarker(payload);
+    if (embedded > 0) {
+      payload = payload.substring(0, embedded).trim();
+    }
+
+    String[] cols = payload.split(",", -1);
+    if ("DECISION".equals(type)) {
+      if (cols.length >= 10) {
+        cols[2] = normalizeKnownToken(cols[2], SECURITY_STATE_NAMES);
+        cols[3] = normalizeKnownToken(cols[3], SECURITY_STATE_NAMES);
+        cols[4] = normalizeKnownToken(cols[4], SECURITY_RESPONSE_NAMES);
+        cols[5] = normalizeKnownToken(cols[5], SECURITY_RESPONSE_NAMES);
+        cols[9] = normalizeKnownToken(cols[9], SECURITY_ATTACK_NAMES);
+      }
+    } else if (cols.length >= 19) {
+      cols[1] = normalizeKnownToken(cols[1], SECURITY_SEVERITY_NAMES);
+      cols[15] = normalizeKnownToken(cols[15], SECURITY_ATTACK_NAMES);
+      cols[17] = normalizeKnownToken(cols[17], SECURITY_STATE_NAMES);
+      cols[18] = normalizeKnownToken(cols[18], SECURITY_RESPONSE_NAMES);
+    }
+    return joinCsvColumns(cols);
   }
 
   private PrintWriter getCsvStream(File file) throws IOException {
@@ -947,6 +1254,8 @@ public class LogListener extends VisPlugin implements HasQuickHelp {
         } else {
           stream.println("type," + csvHeader);
         }
+      } else if ("security_decisions.csv".equals(file.getName())) {
+        stream.println(csvDecisionHeader);
       } else {
         stream.println(csvHeader);
       }
@@ -971,6 +1280,11 @@ public class LogListener extends VisPlugin implements HasQuickHelp {
       closeCsvSplitStreams();
       return;
     }
+    if (message.startsWith("CSV_DECISION_HEADER,")) {
+      csvDecisionHeader = message.substring("CSV_DECISION_HEADER,".length());
+      closeCsvSplitStreams();
+      return;
+    }
 
     if (message.startsWith("ALERT,") && message.contains("source=module")) {
       if (!normalizedMoteId.isEmpty()) {
@@ -987,15 +1301,31 @@ public class LogListener extends VisPlugin implements HasQuickHelp {
     } else if (message.startsWith("CSV_ALERT,")) {
       payload = message.substring("CSV_ALERT,".length());
       type = "ALERT";
+    } else if (message.startsWith("CSV_DECISION,")) {
+      payload = message.substring("CSV_DECISION,".length());
+      type = "DECISION";
     } else {
       return;
     }
 
-    String[] cols = payload.split(",", 4);
-    if (cols.length < 3) {
+    payload = sanitizeCsvPayload(type, payload);
+    if (payload == null || payload.isEmpty()) {
       return;
     }
-    String droneId = cols[2].trim();
+
+    String[] cols = payload.split(",", 4);
+    String droneId;
+    if ("DECISION".equals(type)) {
+      if (cols.length < 2) {
+        return;
+      }
+      droneId = cols[1].trim();
+    } else {
+      if (cols.length < 3) {
+        return;
+      }
+      droneId = cols[2].trim();
+    }
     if (droneId.isEmpty()) {
       return;
     }
@@ -1018,6 +1348,8 @@ public class LogListener extends VisPlugin implements HasQuickHelp {
 
       if (!csvSplitDroneIds.containsKey(droneId)) {
         csvSplitDroneIds.put(droneId, Boolean.TRUE);
+        getCsvStream(new File(sessionDir, "all/security_decisions.csv")).flush();
+        getCsvStream(new File(sessionDir, droneId + "/security_decisions.csv")).flush();
         for (String modulePayload : csvSplitModuleAlerts) {
           appendModuleAlertToDrone(sessionDir, droneId, modulePayload, false);
         }
@@ -1025,6 +1357,17 @@ public class LogListener extends VisPlugin implements HasQuickHelp {
 
       File allDir = new File(sessionDir, "all");
       File droneDir = new File(sessionDir, droneId);
+
+      if ("DECISION".equals(type)) {
+        PrintWriter allDecision = getCsvStream(new File(allDir, "security_decisions.csv"));
+        PrintWriter droneDecision = getCsvStream(new File(droneDir, "security_decisions.csv"));
+        allDecision.println(payload);
+        allDecision.flush();
+        droneDecision.println(payload);
+        droneDecision.flush();
+        updateSecuritySummary(sessionDir, type, payload);
+        return;
+      }
 
       PrintWriter all = getCsvStream(new File(allDir, "telemetry.csv"));
       PrintWriter allData = getCsvStream(new File(allDir, "telemetry_data.csv"));
@@ -1050,6 +1393,7 @@ public class LogListener extends VisPlugin implements HasQuickHelp {
         droneAlert.println(payload);
         droneAlert.flush();
       }
+      updateSecuritySummary(sessionDir, type, payload);
     } catch (IOException e) {
       logger.warn("Could not append split CSV output", e);
     }

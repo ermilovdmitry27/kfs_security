@@ -17,6 +17,7 @@
 
 typedef struct {
   uint8_t used;
+  uint8_t pinned;
   uint8_t drone_id;
   uint8_t channel;
   uint16_t last_seen_seq;
@@ -36,6 +37,9 @@ attack_target_is_active(const attack_target_t *target, uint32_t now)
 {
   if(!target->used) {
     return 0;
+  }
+  if(target->pinned) {
+    return 1;
   }
   return (uint8_t)((now - target->last_seen_t) <= ATTACK_TARGET_TIMEOUT_SEC);
 }
@@ -153,6 +157,27 @@ attack_targets_shutdown(void)
   }
 }
 
+static uint8_t ATTACK_TARGET_UNUSED
+attack_targets_pin_active(void)
+{
+  int i;
+  uint8_t count;
+  uint32_t now;
+
+  count = 0;
+  now = clock_seconds();
+
+  for(i = 0; i < ATTACK_TARGET_MAX; i++) {
+    if(!attack_target_is_active(&attack_targets[i], now)) {
+      continue;
+    }
+    attack_targets[i].pinned = 1;
+    count++;
+  }
+
+  return count;
+}
+
 static uint16_t ATTACK_TARGET_UNUSED
 attack_target_next_seq(attack_target_t *target)
 {
@@ -203,6 +228,36 @@ attack_targets_for_each(attack_target_visit_fn visit, void *ctx)
   }
 
   return count;
+}
+
+static attack_target_t *ATTACK_TARGET_UNUSED
+attack_targets_next_active(uint8_t *cursor)
+{
+  int i;
+  uint8_t start;
+  uint8_t index;
+  uint32_t now;
+
+  if(cursor == NULL) {
+    return NULL;
+  }
+
+  now = clock_seconds();
+  start = *cursor;
+
+  for(i = 0; i < ATTACK_TARGET_MAX; i++) {
+    index = (uint8_t)((start + i) % ATTACK_TARGET_MAX);
+    if(!attack_target_is_active(&attack_targets[index], now)) {
+      if(attack_targets[index].used && !attack_targets[index].pinned) {
+        memset(&attack_targets[index], 0, sizeof(attack_targets[index]));
+      }
+      continue;
+    }
+    *cursor = (uint8_t)((index + 1) % ATTACK_TARGET_MAX);
+    return &attack_targets[index];
+  }
+
+  return NULL;
 }
 
 #endif

@@ -9,6 +9,8 @@ This scenario simulates drone telemetry collection and sink-side detection over 
 - `t` (drone time)
 - `attack` (detected attack type)
 - `hazard` (detected physical hazard)
+- `risk`, `state`, `response` (security manager assessment)
+- `security_decisions.csv` records state transitions and selected reactions
 
 ## Alert flags (`alerts`)
 
@@ -49,8 +51,8 @@ Notes:
 - A simple MAC (FNV1a with shared key) protects against spoofing/tampering.
 - Data is sent via Rime mesh (multi-hop). Drones send to sink ID=1 (set sink mote ID to 1 in Cooja, or change `sink_addr` in `drone.c`).
 - Optional `relay.c` motes act as dedicated mesh relays.
-- Optional `relay_blackhole.c` disables its radio after startup (blackhole).
-- Optional `relay_selective.c` toggles radio on/off (selective forwarding).
+- Optional `relay_blackhole.c` finds an existing relay and enables blackhole mode on it.
+- Optional `relay_selective.c` finds an existing relay and enables selective forwarding mode on it.
 - Optional `jammer.c` motes flood the base channel (129) to simulate jamming.
 - Optional attackers:
   - `attacker_replay.c` (replay)
@@ -67,7 +69,25 @@ Notes:
 - `ALERT,...` alert event
 - `CSV_DATA,...` telemetry in CSV format (includes `attack`, `hazard`)
 - `CSV_ALERT,...` alert in CSV format (includes `attack`, `hazard`)
+- `CSV_DECISION,...` security manager decision event
+- `CSV_DECISION_HEADER,...` decision CSV columns
 - `CSV_HEADER,...` CSV columns
+- `security_summary.csv` run-level security summary
+
+Security manager fields:
+
+- `risk`: node risk score `0..100`
+- `state`: `NORMAL`, `SUSPICIOUS`, `UNDER_ATTACK`, `ISOLATED`, `RECOVERING`, `RECOVERED`
+- `response`: recommended reaction such as `channel_hop`, `rate_limit`, `quarantine`, `reroute`, `isolate_relay`
+- `reason` in `security_decisions.csv`: detection reason or applied policy, e.g. `replay`, `flood`, `apply_quarantine`, `apply_reroute`, `quarantine_released`, `rate_limit_released`, `recovered`
+
+Implemented reactions:
+
+- `channel_hop`: sink forces all honest nodes to switch channel on repeated packet gaps
+- `rate_limit`: sink sends a control command and the drone temporarily increases its telemetry interval
+- `quarantine`: sink commands the drone to pause telemetry and also drops incoming packets for that drone during the quarantine window
+- `reroute`: sink tells drones to rotate to another visible relay path; if no relay is available they fall back to direct sink delivery
+- `isolate_relay`: sink tells drones to temporarily blacklist the current relay and switch to another visible relay
 
 ## Build
 
@@ -182,9 +202,12 @@ cd ~/diplom_kfs_security/examples/drone_sim
 - `output/run_<YYYYMMDD_HHMMSS>/all/telemetry.csv`
 - `output/run_<YYYYMMDD_HHMMSS>/all/telemetry_data.csv`
 - `output/run_<YYYYMMDD_HHMMSS>/all/telemetry_alert.csv`
+- `output/run_<YYYYMMDD_HHMMSS>/all/security_decisions.csv`
+- `output/run_<YYYYMMDD_HHMMSS>/all/security_summary.csv`
 - `output/run_<YYYYMMDD_HHMMSS>/<drone_id>/telemetry.csv`
 - `output/run_<YYYYMMDD_HHMMSS>/<drone_id>/telemetry_data.csv`
 - `output/run_<YYYYMMDD_HHMMSS>/<drone_id>/telemetry_alert.csv`
+- `output/run_<YYYYMMDD_HHMMSS>/<drone_id>/security_decisions.csv`
 
 ### Optional: enable auto-append at startup (no dialog every run)
 

@@ -14,6 +14,11 @@
 #define MAC_KEY 0x6a09e667u
 
 #define SPOOF_INTERVAL_MS 1000
+#define SPOOF_DISCOVERY_WARMUP_SEC 3
+#define SPOOF_DISCOVERY_MAX_WAIT_SEC 8
+#define SPOOF_MIN_LOCK_TARGETS 3
+#define SPOOF_SLOT_SEC 3
+#define SPOOF_BURST_PACKETS 2
 
 PROCESS(attacker_spoof_proc, "Attacker spoof");
 AUTOSTART_PROCESSES(&attacker_spoof_proc);
@@ -43,12 +48,18 @@ static uint8_t current_channel = RADIO_CHANNEL_START;
 static uint8_t channel_index = 0;
 static const uint8_t channel_list[RADIO_CHANNEL_COUNT] = {129, 130, 131, 132};
 static const linkaddr_t sink_addr = {{1, 0}};
+static uint8_t targets_pinned;
+static uint8_t target_cursor;
+static uint32_t warmup_started_at;
+static uint32_t slot_started_at;
+static uint8_t slot_packets_sent;
+static attack_target_t *slot_target;
 
 static void recv_mesh(struct mesh_conn *c, const linkaddr_t *from, uint8_t hops);
 static const struct mesh_callbacks mesh_cb = { recv_mesh, NULL, NULL };
 static struct mesh_conn mesh;
 
-static void send_spoof_to_target(attack_target_t *target, void *ctx);
+static void maybe_send_spoof(void);
 
 static uint32_t
 mac_fnv1a(const void *data, size_t len)
@@ -116,11 +127,17 @@ PROCESS_THREAD(attacker_spoof_proc, ev, data)
   current_channel = channel_list[channel_index % RADIO_CHANNEL_COUNT];
   mesh_open(&mesh, current_channel, &mesh_cb);
   attack_targets_init();
+  targets_pinned = 0;
+  target_cursor = 0;
+  warmup_started_at = clock_seconds();
+  slot_started_at = 0;
+  slot_packets_sent = 0;
+  slot_target = NULL;
   etimer_set(&timer, (CLOCK_SECOND * SPOOF_INTERVAL_MS) / 1000);
 
   while(1) {
     PROCESS_WAIT_EVENT_UNTIL(etimer_expired(&timer));
-    attack_targets_for_each(send_spoof_to_target, NULL);
+    maybe_send_spoof();
 
     etimer_reset(&timer);
   }
@@ -129,15 +146,51 @@ PROCESS_THREAD(attacker_spoof_proc, ev, data)
 }
 
 static void
-send_spoof_to_target(attack_target_t *target, void *ctx)
+maybe_send_spoof(void)
 {
+  uint32_t now;
   sensor_msg_t msg;
-  (void)ctx;
+  uint8_t visible_targets;
+  uint8_t pinned_count;
+
+  now = clock_seconds();
+
+  if(!targets_pinned) {
+    visible_targets = attack_targets_for_each(NULL, NULL);
+
+    if(((now - warmup_started_at) >= SPOOF_DISCOVERY_WARMUP_SEC &&
+        visible_targets >= SPOOF_MIN_LOCK_TARGETS) ||
+       (now - warmup_started_at) >= SPOOF_DISCOVERY_MAX_WAIT_SEC) {
+      pinned_count = attack_targets_pin_active();
+      if(pinned_count > 0) {
+        attack_targets_shutdown();
+        targets_pinned = 1;
+        slot_started_at = 0;
+        slot_packets_sent = 0;
+        slot_target = NULL;
+      }
+    }
+
+    if(!targets_pinned) {
+      return;
+    }
+  }
+
+  if(slot_target == NULL || slot_started_at == 0 ||
+     (now - slot_started_at) >= SPOOF_SLOT_SEC) {
+    slot_target = attack_targets_next_active(&target_cursor);
+    slot_started_at = now;
+    slot_packets_sent = 0;
+  }
+
+  if(slot_target == NULL || slot_packets_sent >= SPOOF_BURST_PACKETS) {
+    return;
+  }
 
   msg.ver = MSG_VER;
-  msg.drone_id = target->drone_id;
-  msg.seq = attack_target_next_seq(target);
-  msg.t = clock_seconds();
+  msg.drone_id = slot_target->drone_id;
+  msg.seq = attack_target_next_seq(slot_target);
+  msg.t = now;
   msg.temp = 25 + (random_rand() % 5);
   msg.vib = 50 + (random_rand() % 20);
   msg.gas = 80 + (random_rand() % 20);
@@ -147,7 +200,8 @@ send_spoof_to_target(attack_target_t *target, void *ctx)
   msg.mac = mac_fnv1a(&msg, sizeof(msg));
   msg.mac ^= 0xffffffffu; /* tamper */
 
-  set_channel(target->channel);
+  set_channel(slot_target->channel);
   packetbuf_copyfrom(&msg, sizeof(msg));
   mesh_send(&mesh, &sink_addr);
+  slot_packets_sent++;
 }

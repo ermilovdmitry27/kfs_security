@@ -9,6 +9,7 @@
 
 #define RADIO_CHANNEL_START 129
 #define RADIO_CHANNEL_COUNT 4
+#define JAMMER_START_DELAY_SEC 5
 #define JAMMER_INTERVAL_MS 10
 #define JAMMER_PAYLOAD_SIZE 110
 
@@ -42,12 +43,16 @@ PROCESS_THREAD(jammer_proc, ev, data)
 
   current_channel = channel_list[channel_index % RADIO_CHANNEL_COUNT];
   broadcast_open(&bc, current_channel, &bc_cb);
-  attack_report_emit(REPORT_ALERT_PKT_GAP, "jamming");
-  etimer_set(&timer, (CLOCK_SECOND * JAMMER_INTERVAL_MS) / 1000);
+  etimer_set(&timer, CLOCK_SECOND * JAMMER_START_DELAY_SEC);
 
   for(i = 0; i < (int)sizeof(payload); i++) {
     payload[i] = (uint8_t)(random_rand() & 0xff);
   }
+
+  PROCESS_WAIT_EVENT_UNTIL(etimer_expired(&timer));
+
+  attack_report_emit(REPORT_ALERT_PKT_GAP, "jamming");
+  etimer_set(&timer, (CLOCK_SECOND * JAMMER_INTERVAL_MS) / 1000);
 
   while(1) {
     PROCESS_WAIT_EVENT_UNTIL(etimer_expired(&timer));
